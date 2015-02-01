@@ -26,6 +26,7 @@
 #include "node.h"
 #include "node_buffer.h"
 #include "string_bytes.h"
+#include "util.h"
 
 #include <string.h>
 #ifdef _MSC_VER
@@ -157,6 +158,48 @@ Handle<Value> ThrowCryptoTypeError(unsigned long err) {
 }
 
 
+// Ensure that OpenSSL has enough entropy (at least 256 bits) for its PRNG.
+// The entropy pool starts out empty and needs to fill up before the PRNG
+// can be used securely.  Once the pool is filled, it never dries up again;
+// its contents is stirred and reused when necessary.
+//
+// OpenSSL normally fills the pool automatically but not when someone starts
+// generating random numbers before the pool is full: in that case OpenSSL
+// keeps lowering the entropy estimate to thwart attackers trying to guess
+// the initial state of the PRNG.
+//
+// When that happens, we will have to wait until enough entropy is available.
+// That should normally never take longer than a few milliseconds.
+//
+// OpenSSL draws from /dev/random and /dev/urandom.  While /dev/random may
+// block pending "true" randomness, /dev/urandom is a CSPRNG that doesn't
+// block under normal circumstances.
+//
+// The only time when /dev/urandom may conceivably block is right after boot,
+// when the whole system is still low on entropy.  That's not something we can
+// do anything about.
+inline void CheckEntropy() {
+  for (;;) {
+    int status = RAND_status();
+    assert(status >= 0);  // Cannot fail.
+    if (status != 0)
+      break;
+    if (RAND_poll() == 0)  // Give up, RAND_poll() not supported.
+      break;
+  }
+}
+
+
+bool EntropySource(unsigned char* buffer, size_t length) {
+  // Ensure that OpenSSL's PRNG is properly seeded.
+  CheckEntropy();
+  // RAND_bytes() can return 0 to indicate that the entropy data is not truly
+  // random. That's okay, it's still better than V8's stock source of entropy,
+  // which is /dev/urandom on UNIX platforms and the current time on Windows.
+  return RAND_bytes(buffer, length) != -1;
+}
+
+
 void SecureContext::Initialize(Handle<Object> target) {
   HandleScope scope;
 
@@ -199,7 +242,7 @@ Handle<Value> SecureContext::Init(const Arguments& args) {
   OPENSSL_CONST SSL_METHOD *method = SSLv23_method();
 
   if (args.Length() == 1 && args[0]->IsString()) {
-    String::Utf8Value sslmethod(args[0]);
+    node::Utf8Value sslmethod(args[0]);
 
     if (strcmp(*sslmethod, "SSLv2_method") == 0) {
 #ifndef OPENSSL_NO_SSL2
@@ -319,7 +362,7 @@ static BIO* LoadBIO (Handle<Value> v) {
   int r = -1;
 
   if (v->IsString()) {
-    String::Utf8Value s(v);
+    node::Utf8Value s(v);
     r = BIO_write(bio, *s, s.length());
   } else if (Buffer::HasInstance(v)) {
     char* buffer_data = Buffer::Data(v);
@@ -371,7 +414,7 @@ Handle<Value> SecureContext::SetKey(const Arguments& args) {
   BIO *bio = LoadBIO(args[0]);
   if (!bio) return False();
 
-  String::Utf8Value passphrase(args[1]);
+  node::Utf8Value passphrase(args[1]);
 
   EVP_PKEY* key = PEM_read_bio_PrivateKey(bio, NULL, NULL,
                                           len == 1 ? NULL : *passphrase);
@@ -601,7 +644,7 @@ Handle<Value> SecureContext::SetCiphers(const Arguments& args) {
     return ThrowException(Exception::TypeError(String::New("Bad parameter")));
   }
 
-  String::Utf8Value ciphers(args[0]);
+  node::Utf8Value ciphers(args[0]);
   SSL_CTX_set_cipher_list(sc->ctx_, *ciphers);
 
   return True();
@@ -630,7 +673,7 @@ Handle<Value> SecureContext::SetSessionIdContext(const Arguments& args) {
     return ThrowException(Exception::TypeError(String::New("Bad parameter")));
   }
 
-  String::Utf8Value sessionIdContext(args[0]);
+  node::Utf8Value sessionIdContext(args[0]);
   const unsigned char* sid_ctx = (const unsigned char*) *sessionIdContext;
   unsigned int sid_ctx_len = sessionIdContext.length();
 
@@ -742,12 +785,14 @@ Handle<Value> SecureContext::LoadPKCS12(const Arguments& args) {
 size_t ClientHelloParser::Write(const uint8_t* data, size_t len) {
   HandleScope scope;
 
+  assert(state_ != kEnded);
+  
   // Just accumulate data, everything will be pushed to BIO later
   if (state_ == kPaused) return 0;
 
   // Copy incoming data to the internal buffer
   // (which has a size of the biggest possible TLS frame)
-  size_t available = sizeof(data_) - offset_;
+  size_t available = kBufferSize - offset_;
   size_t copied = len < available ? len : available;
   memcpy(data_ + offset_, data, copied);
   offset_ += copied;
@@ -782,7 +827,7 @@ size_t ClientHelloParser::Write(const uint8_t* data, size_t len) {
     }
 
     // Sanity check (too big frame, or too small)
-    if (frame_len_ >= sizeof(data_)) {
+    if (frame_len_ >= kBufferSize) {
       // Let OpenSSL handle it
       Finish();
       return copied;
@@ -863,7 +908,6 @@ size_t ClientHelloParser::Write(const uint8_t* data, size_t len) {
     argv[0] = hello;
     MakeCallback(conn_->handle_, onclienthello_sym, 1, argv);
     break;
-   case kEnded:
    default:
     break;
   }
@@ -880,6 +924,9 @@ void ClientHelloParser::Finish() {
   int r = BIO_write(conn_->bio_read_, reinterpret_cast<char*>(data_), offset_);
   conn_->HandleBIOError(conn_->bio_read_, "BIO_write", r);
   conn_->SetShutdownFlags();
+
+  delete[] data_;
+  data_ = NULL;
 }
 
 
@@ -1234,7 +1281,7 @@ Handle<Value> Connection::New(const Arguments& args) {
   if (is_server) {
     SSL_CTX_set_tlsext_servername_callback(sc->ctx_, SelectSNIContextCallback_);
   } else {
-    String::Utf8Value servername(args[2]);
+    node::Utf8Value servername(args[2]);
     SSL_set_tlsext_host_name(p->ssl_, *servername);
   }
 #endif
@@ -2187,7 +2234,7 @@ class Cipher : public ObjectWrap {
     ssize_t key_written = DecodeWrite(key_buf, key_buf_len, args[1], BINARY);
     assert(key_written == key_buf_len);
 
-    String::Utf8Value cipherType(args[0]);
+    node::Utf8Value cipherType(args[0]);
 
     bool r = cipher->CipherInit(*cipherType, key_buf, key_buf_len);
 
@@ -2238,7 +2285,7 @@ class Cipher : public ObjectWrap {
     ssize_t iv_written = DecodeWrite(iv_buf, iv_len, args[2], BINARY);
     assert(iv_written == iv_len);
 
-    String::Utf8Value cipherType(args[0]);
+    node::Utf8Value cipherType(args[0]);
 
     bool r = cipher->CipherInitIv(*cipherType, key_buf,key_len,iv_buf,iv_len);
 
@@ -2497,7 +2544,7 @@ class Decipher : public ObjectWrap {
     ssize_t key_written = DecodeWrite(key_buf, key_len, args[1], BINARY);
     assert(key_written == key_len);
 
-    String::Utf8Value cipherType(args[0]);
+    node::Utf8Value cipherType(args[0]);
 
     bool r = cipher->DecipherInit(*cipherType, key_buf,key_len);
 
@@ -2548,7 +2595,7 @@ class Decipher : public ObjectWrap {
     ssize_t iv_written = DecodeWrite(iv_buf, iv_len, args[2], BINARY);
     assert(iv_written == iv_len);
 
-    String::Utf8Value cipherType(args[0]);
+    node::Utf8Value cipherType(args[0]);
 
     bool r = cipher->DecipherInitIv(*cipherType, key_buf,key_len,iv_buf,iv_len);
 
@@ -2729,7 +2776,7 @@ class Hmac : public ObjectWrap {
       return ThrowException(exception);
     }
 
-    String::Utf8Value hashType(args[0]);
+    node::Utf8Value hashType(args[0]);
 
     bool r;
 
@@ -2874,7 +2921,7 @@ class Hash : public ObjectWrap {
         "Must give hashtype string as argument")));
     }
 
-    String::Utf8Value hashType(args[0]);
+    node::Utf8Value hashType(args[0]);
 
     Hash *hash = new Hash();
     if (!hash->HashInit(*hashType)) {
@@ -3048,7 +3095,7 @@ class Sign : public ObjectWrap {
         "Must give signtype string as argument")));
     }
 
-    String::Utf8Value signType(args[0]);
+    node::Utf8Value signType(args[0]);
 
     bool r = sign->SignInit(*signType);
 
@@ -3281,7 +3328,7 @@ class Verify : public ObjectWrap {
         "Must give verifytype string as argument")));
     }
 
-    String::Utf8Value verifyType(args[0]);
+    node::Utf8Value verifyType(args[0]);
 
     bool r = verify->VerifyInit(*verifyType);
 
@@ -3464,7 +3511,7 @@ class DiffieHellman : public ObjectWrap {
           String::New("No group name given")));
     }
 
-    String::Utf8Value group_name(args[0]);
+    node::Utf8Value group_name(args[0]);
 
     modp_group* it = modp_groups;
 
@@ -3985,6 +4032,9 @@ void RandomBytesWork(uv_work_t* work_req) {
                                          RandomBytesRequest,
                                          work_req_);
   int r;
+
+  // Ensure that OpenSSL's PRNG is properly seeded.
+  CheckEntropy();
 
   if (pseudoRandom == true) {
     r = RAND_pseudo_bytes(reinterpret_cast<unsigned char*>(req->data_),

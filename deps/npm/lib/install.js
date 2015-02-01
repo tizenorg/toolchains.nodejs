@@ -74,6 +74,7 @@ var npm = require("./npm.js")
   , archy = require("archy")
   , isGitUrl = require("./utils/is-git-url.js")
   , npmInstallChecks = require("npm-install-checks")
+  , sortedObject = require("sorted-object")
 
 function install (args, cb_) {
   var hasArguments = !!args.length
@@ -187,7 +188,7 @@ function install (args, cb_) {
 }
 
 function findPeerInvalid (where, cb) {
-  readInstalled(where, { log: log.warn }, function (er, data) {
+  readInstalled(where, { log: log.warn, dev: true }, function (er, data) {
     if (er) return cb(er)
 
     cb(null, findPeerInvalid_(data.dependencies, []))
@@ -336,6 +337,7 @@ function save (where, installed, tree, pretty, hasArguments, cb) {
   }
 
   var saveBundle = npm.config.get('save-bundle')
+  var savePrefix = npm.config.get('save-prefix') || "^";
 
   // each item in the tree is a top-level thing that should be saved
   // to the package.json file.
@@ -350,8 +352,9 @@ function save (where, installed, tree, pretty, hasArguments, cb) {
         return w
       }).reduce(function (set, k) {
         var rangeDescriptor = semver.valid(k[1], true) &&
-                              semver.gte(k[1], "0.1.0", true)
-                            ? "^" : ""
+                              semver.gte(k[1], "0.1.0", true) &&
+                              !npm.config.get("save-exact")
+                            ? savePrefix : ""
         set[k[0]] = rangeDescriptor + k[1]
         return set
       }, {})
@@ -378,7 +381,7 @@ function save (where, installed, tree, pretty, hasArguments, cb) {
       var bundle = data.bundleDependencies || data.bundledDependencies
       delete data.bundledDependencies
       if (!Array.isArray(bundle)) bundle = []
-      data.bundleDependencies = bundle
+      data.bundleDependencies = bundle.sort()
     }
 
     log.verbose('saving', things)
@@ -388,8 +391,11 @@ function save (where, installed, tree, pretty, hasArguments, cb) {
       if (saveBundle) {
         var i = bundle.indexOf(t)
         if (i === -1) bundle.push(t)
+        data.bundleDependencies = bundle.sort()
       }
     })
+
+    data[deps] = sortedObject(data[deps])
 
     data = JSON.stringify(data, null, 2) + "\n"
     fs.writeFile(saveTarget, data, function (er) {
@@ -443,7 +449,7 @@ function prettify (tree, installed) {
                      if (g) g = " (" + g + ")"
                      return c.what + g
                    })
-                 })
+                 }, "", { unicode: npm.config.get("unicode") })
   }).join("\n")
 }
 
@@ -704,7 +710,7 @@ function targetResolver (where, context, deps) {
     // already has a matching copy.
     // If it's not a git repo, and the parent already has that pkg, then
     // we can skip installing it again.
-    cache.add(what, function (er, data) {
+    cache.add(what, null, false, function (er, data) {
       if (er && parent && parent.optionalDependencies &&
           parent.optionalDependencies.hasOwnProperty(what.split("@")[0])) {
         log.warn("optional dep failed, continuing", what)

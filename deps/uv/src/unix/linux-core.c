@@ -99,6 +99,7 @@ void uv__platform_loop_delete(uv_loop_t* loop) {
 
 void uv__platform_invalidate_fd(uv_loop_t* loop, int fd) {
   struct uv__epoll_event* events;
+  struct uv__epoll_event dummy;
   uintptr_t i;
   uintptr_t nfds;
 
@@ -106,18 +107,25 @@ void uv__platform_invalidate_fd(uv_loop_t* loop, int fd) {
 
   events = (struct uv__epoll_event*) loop->watchers[loop->nwatchers];
   nfds = (uintptr_t) loop->watchers[loop->nwatchers + 1];
-  if (events == NULL)
-    return;
+  if (events != NULL)
+    /* Invalidate events with same file descriptor */
+    for (i = 0; i < nfds; i++)
+      if ((int) events[i].data == fd)
+        events[i].data = -1;
 
-  /* Invalidate events with same file descriptor */
-  for (i = 0; i < nfds; i++)
-    if ((int) events[i].data == fd)
-      events[i].data = -1;
+  /* Remove the file descriptor from the epoll.
+   * This avoids a problem where the same file description remains open
+   * in another process, causing repeated junk epoll events.
+   *
+   * We pass in a dummy epoll_event, to work around a bug in old kernels.
+   */
+  if (loop->backend_fd >= 0)
+    uv__epoll_ctl(loop->backend_fd, UV__EPOLL_CTL_DEL, fd, &dummy);
 }
 
 
 void uv__io_poll(uv_loop_t* loop, int timeout) {
-  struct uv__epoll_event events[1024] = {0, };
+  struct uv__epoll_event events[1024];
   struct uv__epoll_event* pe;
   struct uv__epoll_event e;
   ngx_queue_t* q;
@@ -130,7 +138,6 @@ void uv__io_poll(uv_loop_t* loop, int timeout) {
   int fd;
   int op;
   int i;
-
 
   if (loop->nfds == 0) {
     assert(ngx_queue_empty(&loop->watcher_queue));
@@ -219,7 +226,7 @@ void uv__io_poll(uv_loop_t* loop, int timeout) {
       /* Skip invalidated events, see uv__platform_invalidate_fd */
       if (fd == -1)
         continue;
-    
+
       assert(fd >= 0);
       assert((unsigned) fd < loop->nwatchers);
 

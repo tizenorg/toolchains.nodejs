@@ -1,11 +1,12 @@
 Name:          nodejs
-Version:       0.10.26
+Version:       0.10.29
 Release:       1
 Summary:       Evented I/O for V8 JavaScript
 Group:         System/Service
 URL:           http://nodejs.org/
 Source0:       %{name}-%{version}.tar.gz
 Source1:       nodejs.pc
+Patch1:	       no-parallel.patch
 License:       MIT
 BuildRequires: glibc-devel
 BuildRequires: openssl-devel
@@ -29,8 +30,21 @@ Requires: %{name} = %{version}
 %description devel
 dev package
 
+%ifarch %{arm}
+%package -n nodejs-x86-arm
+Summary: node x86 runtime - speed up building node related packages
+Group:   Development/Libraries
+Requires: %{name}-devel = %{version}
+AutoReqProv: no
+
+%description -n nodejs-x86-arm
+node x86 runtime - speed up building node related packages
+%endif
+
 %prep
 %setup -q
+
+%patch1 -p1
 
 %build
 
@@ -50,10 +64,24 @@ install -m0644 %SOURCE1 %{buildroot}/usr/lib/pkgconfig
 rm -fR %{buildroot}/usr/lib/dtrace
 find %{buildroot}/usr/lib/node_modules -name '\.*' -delete
 
+%ifarch %{arm}
+mkdir -p %{buildroot}/emul/ia32-linux/usr/bin/
+install -m0755 node-x86/node %{buildroot}/emul/ia32-linux/usr/bin/
+%endif
+
 %fdupes %{buildroot}/usr/lib/node_modules
 
 %docs_package
 
+%ifarch %{arm}
+%post -n nodejs-x86-arm
+if test -e /usr/bin/node.orig-arm -a -h /usr/bin/node; then 
+    echo "skipping change /usr/bin/node"
+else
+    mv /usr/bin/node /usr/bin/node.orig-arm
+    ln -sf /emul/ia32-linux/usr/bin/node /usr/bin/node
+fi
+%endif
 
 %files
 %defattr(-,root,root)
@@ -67,3 +95,7 @@ find %{buildroot}/usr/lib/node_modules -name '\.*' -delete
 /usr/include/node/*
 /usr/lib/pkgconfig/nodejs.pc
 
+%ifarch %{arm}
+%files -n nodejs-x86-arm
+/emul/ia32-linux/usr/bin/node
+%endif
