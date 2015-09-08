@@ -13,7 +13,7 @@ view.completion = function (opts, cb) {
     if (er) return cb(er)
     var dv = d.versions[d["dist-tags"][tag]]
       , fields = []
-    d.versions = Object.keys(d.versions).sort(semver.compare)
+    d.versions = Object.keys(d.versions).sort(semver.compareLoose)
     fields = getFields(d).concat(getFields(dv))
     cb(null, fields)
   })
@@ -39,14 +39,11 @@ view.completion = function (opts, cb) {
   }
 }
 
-var registry = require("./utils/npm-registry-client/index.js")
-  , ini = require("ini")
-  , log = require("./utils/log.js")
+var npm = require("./npm.js")
+  , registry = npm.registry
+  , log = require("npmlog")
   , util = require("util")
-  , output
-  , npm = require("./npm.js")
   , semver = require("semver")
-  , readJson = require("./utils/read-json.js")
 
 function view (args, silent, cb) {
   if (typeof cb !== "function") cb = silent, silent = false
@@ -59,15 +56,26 @@ function view (args, silent, cb) {
   if (name === ".") return cb(view.usage)
 
   // get the data about this package
-  registry.get(name, null, 600, function (er, data) {
+  registry.get(name, function (er, data) {
     if (er) return cb(er)
-    if (data["dist-tags"].hasOwnProperty(version)) {
+    if (data["dist-tags"] && data["dist-tags"].hasOwnProperty(version)) {
       version = data["dist-tags"][version]
     }
+
+    if (data.time && data.time.unpublished) {
+      var u = data.time.unpublished
+      var er = new Error("Unpublished by " + u.name + " on " + u.time)
+      er.statusCode = 404
+      er.code = "E404"
+      er.pkgid = data._id
+      return cb(er, data)
+    }
+
+
     var results = []
       , error = null
-      , versions = data.versions
-    data.versions = Object.keys(data.versions).sort(semver.compare)
+      , versions = data.versions || {}
+    data.versions = Object.keys(versions).sort(semver.compareLoose)
     if (!args.length) args = [""]
 
     // remove readme unless we asked for it
@@ -76,12 +84,7 @@ function view (args, silent, cb) {
     }
 
     Object.keys(versions).forEach(function (v) {
-      try {
-        versions[v] = readJson.processJson(versions[v])
-      } catch (ex) {
-        delete versions[v]
-      }
-      if (semver.satisfies(v, version)) args.forEach(function (args) {
+      if (semver.satisfies(v, version, true)) args.forEach(function (args) {
         // remove readme unless we asked for it
         if (-1 === args.indexOf("readme")) {
           delete versions[v].readme
@@ -94,7 +97,7 @@ function view (args, silent, cb) {
 
     if (args.length === 1 && args[0] === "") {
       retval = cleanBlanks(retval)
-      log.silly(retval, "cleanup")
+      log.silly("cleanup", retval)
     }
 
     if (error || silent) cb(error, retval)
@@ -190,7 +193,6 @@ function printData (data, name, cb) {
     , msg = ""
     , showVersions = versions.length > 1
     , showFields
-  function cb_ (er) { return cb(er, data) }
 
   versions.forEach(function (v, i) {
     var fields = Object.keys(data[v])
@@ -198,16 +200,22 @@ function printData (data, name, cb) {
     fields.forEach(function (f) {
       var d = cleanup(data[v][f])
       if (showVersions || showFields || typeof d !== "string") {
-        d = util.inspect(cleanup(data[v][f]), false, 5, true)
+        d = cleanup(data[v][f])
+        d = npm.config.get("json")
+          ? JSON.stringify(d, null, 2)
+          : util.inspect(d, false, 5, npm.color)
+      } else if (typeof d === "string" && npm.config.get("json")) {
+        d = JSON.stringify(d)
       }
       if (f && showFields) f += " = "
-      if (d.indexOf("\n") !== -1) d = "\n" + d
+      if (d.indexOf("\n") !== -1) d = " \n" + d
       msg += (showVersions ? name + "@" + v + " " : "")
            + (showFields ? f : "") + d + "\n"
     })
   })
-  output = output || require("./utils/output.js")
-  output.write(msg, cb_)
+
+  console.log(msg)
+  cb(null, data)
 }
 function cleanup (data) {
   if (Array.isArray(data)) {

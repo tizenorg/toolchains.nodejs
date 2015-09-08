@@ -18,15 +18,14 @@ deprecate.completion = function (opts, cb) {
   })
 }
 
-var registry = require("./utils/npm-registry-client/index.js")
-  , semver = require("semver")
-  , log = require("./utils/log.js")
+var semver = require("semver")
   , npm = require("./npm.js")
+  , registry = npm.registry
 
 function deprecate (args, cb) {
   var pkg = args[0]
     , msg = args[1]
-  if (msg === undefined) return cb(new Error(deprecate.usage))
+  if (msg === undefined) return cb("Usage: " + deprecate.usage)
   // fetch the data and make sure it exists.
   pkg = pkg.split(/@/)
   var name = pkg.shift()
@@ -38,11 +37,11 @@ function deprecate (args, cb) {
     if (er) return cb(er)
     // filter all the versions that match
     Object.keys(data.versions).filter(function (v) {
-      return semver.satisfies(v, ver)
+      return semver.satisfies(v, ver, true)
     }).forEach(function (v) {
       data.versions[v].deprecated = msg
     })
     // now update the doc on the registry
-    registry.request.PUT(data._id, data, cb)
+    registry.request('PUT', data._id, data, cb)
   })
 }

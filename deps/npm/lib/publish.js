@@ -2,16 +2,15 @@
 module.exports = publish
 
 var npm = require("./npm.js")
-  , registry = require("./utils/npm-registry-client/index.js")
-  , log = require("./utils/log.js")
+  , log = require("npmlog")
   , tar = require("./utils/tar.js")
-  , sha = require("./utils/sha.js")
   , path = require("path")
-  , readJson = require("./utils/read-json.js")
+  , readJson = require("read-package-json")
   , fs = require("graceful-fs")
   , lifecycle = require("./utils/lifecycle.js")
   , chain = require("slide").chain
-  , output = require("./utils/output.js")
+  , Conf = require("npmconf").Conf
+  , RegClient = require("npm-registry-client")
 
 publish.usage = "npm publish <tarball>"
               + "\nnpm publish <folder>"
@@ -29,32 +28,39 @@ function publish (args, isRetry, cb) {
   if (args.length === 0) args = ["."]
   if (args.length !== 1) return cb(publish.usage)
 
-  log.verbose(args, "publish")
+  log.verbose("publish", args)
   var arg = args[0]
   // if it's a local folder, then run the prepublish there, first.
   readJson(path.resolve(arg, "package.json"), function (er, data) {
+    er = needVersion(er, data)
+    if (er && er.code !== "ENOENT" && er.code !== "ENOTDIR") return cb(er)
     // error is ok.  could be publishing a url or tarball
+    // however, that means that we will not have automatically run
+    // the prepublish script, since that gets run when adding a folder
+    // to the cache.
     if (er) return cacheAddPublish(arg, false, isRetry, cb)
-    lifecycle(data, "prepublish", arg, function (er) {
-      if (er) return cb(er)
-      cacheAddPublish(arg, true, isRetry, cb)
-    })
+    cacheAddPublish(arg, true, isRetry, cb)
   })
 }
 
-function cacheAddPublish (arg, didPre, isRetry, cb) {
-  npm.commands.cache.add(arg, function (er, data) {
+// didPre in this case means that we already ran the prepublish script,
+// and that the "dir" is an actual directory, and not something silly
+// like a tarball or name@version thing.
+// That means that we can run publish/postpublish in the dir, rather than
+// in the cache dir.
+function cacheAddPublish (dir, didPre, isRetry, cb) {
+  npm.commands.cache.add(dir, null, false, function (er, data) {
     if (er) return cb(er)
-    log.silly(data, "publish")
+    log.silly("publish", data)
     var cachedir = path.resolve( npm.cache
                                , data.name
                                , data.version
                                , "package" )
     chain
       ( [ !didPre && [lifecycle, data, "prepublish", cachedir]
-        , [publish_, arg, data, isRetry, cachedir]
-        , [lifecycle, data, "publish", cachedir]
-        , [lifecycle, data, "postpublish", cachedir] ]
+        , [publish_, dir, data, isRetry, cachedir]
+        , [lifecycle, data, "publish", didPre ? dir : cachedir]
+        , [lifecycle, data, "postpublish", didPre ? dir : cachedir] ]
       , cb )
   })
 }
@@ -63,104 +69,50 @@ function publish_ (arg, data, isRetry, cachedir, cb) {
   if (!data) return cb(new Error("no package.json file found"))
 
   // check for publishConfig hash
+  var registry = npm.registry
   if (data.publishConfig) {
-    Object.keys(data.publishConfig).forEach(function (k) {
-      log.info(k + "=" + data.publishConfig[k], "publishConfig")
-      npm.config.set(k, data.publishConfig[k])
-    })
+    var pubConf = new Conf(npm.config)
+    pubConf.save = npm.config.save.bind(npm.config)
+
+    // don't modify the actual publishConfig object, in case we have
+    // to set a login token or some other data.
+    pubConf.unshift(Object.keys(data.publishConfig).reduce(function (s, k) {
+      s[k] = data.publishConfig[k]
+      return s
+    }, {}))
+    registry = new RegClient(pubConf)
   }
+
+  data._npmVersion = npm.version
+  data._npmUser = { name: npm.config.get("username")
+                  , email: npm.config.get("email") }
 
   delete data.modules
   if (data.private) return cb(new Error
     ("This package has been marked as private\n"
     +"Remove the 'private' field from the package.json to publish it."))
 
-  // pre-build
-  var bd = data.scripts
-           && ( data.scripts.preinstall
-             || data.scripts.install
-             || data.scripts.postinstall )
-           && npm.config.get("bindist")
-           && npm.config.get("bin-publish")
-  preBuild(data, bd, function (er, tb) {
-    if (er) return cb(er)
-    return regPublish(data, tb, isRetry, arg, cachedir, cb)
-  })
-}
-
-
-function preBuild (data, bd, cb) {
-  if (!bd) return cb()
-  // unpack to cache/n/v/build
-  // build there
-  // pack to cache/package-<bd>.tgz
-  var cf = path.resolve(npm.cache, data.name, data.version)
-  var pb = path.resolve(cf, "build")
-    , buildTarget = path.resolve(pb, "node_modules", data.name)
-    , tb = path.resolve(cf, "package-"+bd+".tgz")
-    , sourceBall = path.resolve(cf, "package.tgz")
-
-  log.verbose("about to cache unpack")
-  log.verbose(sourceBall, "the tarball")
-  npm.commands.install(pb, sourceBall, function (er) {
-    log.info(data._id, "prebuild done")
-    // build failure just means that we can't prebuild
-    if (er) {
-      log.warn(er.message, "prebuild failed "+bd)
-      return cb()
-    }
-    // now strip the preinstall/install scripts
-    // they've already been run.
-    var pbj = path.resolve(buildTarget, "package.json")
-    readJson(pbj, function (er, pbo) {
-      if (er) return cb(er)
-      if (pbo.scripts) {
-        delete pbo.scripts.preinstall
-        delete pbo.scripts.install
-        delete pbo.scripts.postinstall
-      }
-      pbo.prebuilt = bd
-      pbo.files = pbo.files || []
-      pbo.files.push("build")
-      pbo.files.push("build/")
-      pbo.files.push("*.node")
-      pbo.files.push("*.js")
-      fs.writeFile(pbj, JSON.stringify(pbo, null, 2), function (er) {
-        if (er) return cb(er)
-        tar.pack(tb, buildTarget, pbo, true, function (er) {
-          if (er) return cb(er)
-          // try to validate the shasum, too
-          sha.get(tb, function (er, shasum) {
-            if (er) return cb(er)
-            // binary distribution requires shasum checking.
-            if (!shasum) return cb()
-            data.dist.bin = data.dist.bin || {}
-            data.dist.bin[bd] = data.dist.bin[bd] || {}
-            data.dist.bin[bd].shasum = shasum
-            return cb(null, tb)
-          })
-        })
+  var tarball = cachedir + ".tgz"
+  registry.publish(data, tarball, function (er) {
+    if (er && er.code === "EPUBLISHCONFLICT"
+        && npm.config.get("force") && !isRetry) {
+      log.warn("publish", "Forced publish over "+data._id)
+      return npm.commands.unpublish([data._id], function (er) {
+        // ignore errors.  Use the force.  Reach out with your feelings.
+        // but if it fails again, then report the first error.
+        publish([arg], er || true, cb)
       })
-    })
+    }
+    // report the unpublish error if this was a retry and unpublish failed
+    if (er && isRetry && isRetry !== true) return cb(isRetry)
+    if (er) return cb(er)
+    console.log("+ " + data._id)
+    cb()
   })
 }
 
-function regPublish (data, prebuilt, isRetry, arg, cachedir, cb) {
-  // check to see if there's a README.md in there.
-  var readme = path.resolve(cachedir, "README.md")
-  fs.readFile(readme, function (er, readme) {
-    // ignore error.  it's an optional feature
-    registry.publish(data, prebuilt, readme, function (er) {
-      if (er && er.errno === npm.EPUBLISHCONFLICT
-          && npm.config.get("force") && !isRetry) {
-        log.warn("Forced publish over "+data._id, "publish")
-        return npm.commands.unpublish([data._id], function (er) {
-          // ignore errors.  Use the force.  Reach out with your feelings.
-          publish([arg], true, cb)
-        })
-      }
-      if (er) return cb(er)
-      output.write("+ " + data._id, cb)
-    })
-  })
+function needVersion(er, data) {
+  return er ? er
+       : (data && !data.version) ? new Error("No version provided")
+       : null
 }

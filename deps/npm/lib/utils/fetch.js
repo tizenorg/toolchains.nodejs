@@ -6,17 +6,21 @@ var request = require("request")
   , fs = require("graceful-fs")
   , npm = require("../npm.js")
   , url = require("url")
-  , log = require("./log.js")
+  , log = require("npmlog")
   , path = require("path")
-  , mkdir = require("./mkdir-p.js")
+  , mkdir = require("mkdirp")
+  , chownr = require("chownr")
   , regHost
+  , once = require("once")
+  , crypto = require("crypto")
 
 module.exports = fetch
 
 function fetch (remote, local, headers, cb) {
   if (typeof cb !== "function") cb = headers, headers = {}
-  log.verbose(local, "fetch to")
-  mkdir(path.dirname(local), function (er) {
+  cb = once(cb)
+  log.verbose("fetch", "to=", local)
+  mkdir(path.dirname(local), function (er, made) {
     if (er) return cb(er)
     fetch_(remote, local, headers, cb)
   })
@@ -24,23 +28,43 @@ function fetch (remote, local, headers, cb) {
 
 function fetch_ (remote, local, headers, cb) {
   var fstr = fs.createWriteStream(local, { mode : npm.modes.file })
+  var response = null
+
   fstr.on("error", function (er) {
-    fs.close(fstr.fd, function () {})
-    if (fstr._ERROR) return
-    cb(fstr._ERROR = er)
+    cb(er)
+    fstr.destroy()
   })
-  fstr.on("open", function () {
-    makeRequest(remote, fstr, headers)
+
+  var req = makeRequest(remote, fstr, headers)
+  req.on("response", function (res) {
+    log.http(res.statusCode, remote)
+    response = res
+    response.resume()
+    // Work around bug in node v0.10.0 where the CryptoStream
+    // gets stuck and never starts reading again.
+    if (process.version === "v0.10.0") {
+      response.resume = function (orig) { return function() {
+        var ret = orig.apply(response, arguments)
+        if (response.socket.encrypted)
+          response.socket.encrypted.read(0)
+        return ret
+      }}(response.resume)
+    }
   })
+
   fstr.on("close", function () {
-    if (fstr._ERROR) return
-    cb()
+    var er
+    if (response && response.statusCode && response.statusCode >= 400) {
+      er = new Error(response.statusCode + " "
+                    + require("http").STATUS_CODES[response.statusCode])
+    }
+    cb(er, response)
   })
 }
 
 function makeRequest (remote, fstr, headers) {
   remote = url.parse(remote)
-  log.http(remote.href, "GET")
+  log.http("GET", remote.href)
   regHost = regHost || url.parse(npm.config.get("registry")).host
 
   if (remote.host === regHost && npm.config.get("always-auth")) {
@@ -50,17 +74,33 @@ function makeRequest (remote, fstr, headers) {
       "Auth required and none provided. Please run 'npm adduser'"))
   }
 
-  var proxy = npm.config.get( remote.protocol === "https:"
-                            ? "https-proxy"
-                            : "proxy")
-
-  request({ url: remote
-          , proxy: proxy
-          , strictSSL: npm.config.get("strict-ssl")
-          , ca: remote.host === regHost ? npm.config.get("ca") : undefined
-          , onResponse: onResponse }).pipe(fstr)
-  function onResponse (er, res) {
-    if (er) return fstr.emit("error", er)
-    log.http(res.statusCode + " " + remote.href)
+  var proxy
+  if (remote.protocol !== "https:" || !(proxy = npm.config.get("https-proxy"))) {
+    proxy = npm.config.get("proxy")
   }
+
+  var sessionToken = npm.registry.sessionToken
+  if (!sessionToken) {
+    sessionToken = crypto.randomBytes(8).toString("hex")
+    npm.registry.sessionToken = sessionToken
+  }
+
+  var ca = remote.host === regHost ? npm.config.get("ca") : undefined
+  var opts = { url: remote
+             , proxy: proxy
+             , strictSSL: npm.config.get("strict-ssl")
+             , rejectUnauthorized: npm.config.get("strict-ssl")
+             , ca: ca
+             , headers:
+               { "user-agent": npm.config.get("user-agent")
+               , "npm-session": sessionToken
+               , referer: npm.registry.refer
+               }
+             }
+  var req = request(opts)
+  req.on("error", function (er) {
+    fstr.emit("error", er)
+  })
+  req.pipe(fstr)
+  return req
 }

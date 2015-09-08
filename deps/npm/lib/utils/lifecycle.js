@@ -1,17 +1,16 @@
-
 exports = module.exports = lifecycle
 exports.cmd = cmd
+exports.makeEnv = makeEnv
 
-var log = require("./log.js")
-  , exec = require("./exec.js")
+var log = require("npmlog")
+  , spawn = require("child_process").spawn
   , npm = require("../npm.js")
   , path = require("path")
-  , readJson = require("./read-json.js")
   , fs = require("graceful-fs")
   , chain = require("slide").chain
-  , constants = require("constants")
-  , output = require("./output.js")
+  , Stream = require("stream").Stream
   , PATH = "PATH"
+  , uidNumber = require("uid-number")
 
 // windows calls it's path "Path" usually, but this is not guaranteed.
 if (process.platform === "win32") {
@@ -31,8 +30,8 @@ function lifecycle (pkg, stage, wd, unsafe, failOk, cb) {
   while (pkg && pkg._data) pkg = pkg._data
   if (!pkg) return cb(new Error("Invalid package data"))
 
-  log(pkg._id, stage)
-  if (!pkg.scripts) pkg.scripts = {}
+  log.info(stage, pkg._id)
+  if (!pkg.scripts || npm.config.get('ignore-scripts')) pkg.scripts = {}
 
   validWd(wd || path.resolve(npm.dir, pkg.name), function (er, wd) {
     if (er) return cb(er)
@@ -41,13 +40,16 @@ function lifecycle (pkg, stage, wd, unsafe, failOk, cb) {
 
     if ((wd.indexOf(npm.dir) !== 0 || path.basename(wd) !== pkg.name)
         && !unsafe && pkg.scripts[stage]) {
-      log.warn(pkg._id+" "+pkg.scripts[stage], "skipping, cannot run in "+wd)
+      log.warn( "cannot run in wd", "%s %s (wd=%s)"
+              , pkg._id, pkg.scripts[stage], wd)
       return cb()
     }
 
     // set the env variables, then run scripts as a child process.
     var env = makeEnv(pkg)
     env.npm_lifecycle_event = stage
+    env.npm_node_execpath = env.NODE = env.NODE || process.execPath
+    env.npm_execpath = require.main.filename
 
     // "nobody" typically doesn't have permission to write to /tmp
     // even if it's never used, sh freaks out.
@@ -68,6 +70,12 @@ function lifecycle_ (pkg, stage, wd, env, unsafe, failOk, cb) {
   var pathArr = []
     , p = wd.split("node_modules")
     , acc = path.resolve(p.shift())
+
+  // first add the directory containing the `node` executable currently
+  // running, so that any lifecycle script that invoke "node" will execute
+  // this same one.
+  pathArr.unshift(path.dirname(process.execPath))
+
   p.forEach(function (pp) {
     pathArr.unshift(path.join(acc, "node_modules", ".bin"))
     acc = path.join(acc, "node_modules", pp)
@@ -90,14 +98,14 @@ function lifecycle_ (pkg, stage, wd, env, unsafe, failOk, cb) {
 
   if (failOk) {
     cb = (function (cb_) { return function (er) {
-      if (er) log.warn(er.message, "continuing anyway")
+      if (er) log.warn("continuing anyway", er.message)
       cb_()
     }})(cb)
   }
 
   if (npm.config.get("force")) {
     cb = (function (cb_) { return function (er) {
-      if (er) log(er, "forced, continuing")
+      if (er) log.info("forced, continuing", er)
       cb_()
     }})(cb)
   }
@@ -124,50 +132,112 @@ function validWd (d, cb) {
 function runPackageLifecycle (pkg, env, wd, unsafe, cb) {
   // run package lifecycle scripts in the package root, or the nearest parent.
   var stage = env.npm_lifecycle_event
-    , user = unsafe ? null : npm.config.get("user")
-    , group = unsafe ? null : npm.config.get("group")
     , cmd = env.npm_lifecycle_script
-    , sh = "sh"
-    , shFlag = "-c"
+
+  var note = "\n> " + pkg._id + " " + stage + " " + wd
+           + "\n> " + cmd + "\n"
+  runCmd(note, cmd, pkg, env, stage, wd, unsafe, cb)
+}
+
+
+var running = false
+var queue = []
+function dequeue() {
+  running = false
+  if (queue.length) {
+    var r = queue.shift()
+    runCmd.apply(null, r)
+  }
+}
+
+function runCmd (note, cmd, pkg, env, stage, wd, unsafe, cb) {
+  if (running) {
+    queue.push([note, cmd, pkg, env, stage, wd, unsafe, cb])
+    return
+  }
+
+  running = true
+  log.pause()
+  var user = unsafe ? null : npm.config.get("user")
+    , group = unsafe ? null : npm.config.get("group")
+
+  if (log.level !== 'silent') {
+    if (npm.spinner.int) {
+      npm.config.get("logstream").write("\r \r")
+    }
+    console.log(note)
+  }
+  log.verbose("unsafe-perm in lifecycle", unsafe)
+
+  if (process.platform === "win32") {
+    unsafe = true
+  }
+
+  if (unsafe) {
+    runCmd_(cmd, pkg, env, wd, stage, unsafe, 0, 0, cb)
+  } else {
+    uidNumber(user, group, function (er, uid, gid) {
+      runCmd_(cmd, pkg, env, wd, stage, unsafe, uid, gid, cb)
+    })
+  }
+}
+
+function runCmd_ (cmd, pkg, env, wd, stage, unsafe, uid, gid, cb_) {
+
+  function cb (er) {
+    cb_.apply(null, arguments)
+    log.resume()
+    process.nextTick(dequeue)
+  }
+
+  var conf = { cwd: wd
+             , env: env
+             , stdio: [ 0, 1, 2 ]
+             }
+
+  if (!unsafe) {
+    conf.uid = uid ^ 0
+    conf.gid = gid ^ 0
+  }
+
+  var sh = "sh"
+  var shFlag = "-c"
 
   if (process.platform === "win32") {
     sh = "cmd"
     shFlag = "/c"
+    conf.windowsVerbatimArguments = true
   }
 
-  log.verbose(unsafe, "unsafe-perm in lifecycle")
-
-  var note = "\n> " + pkg._id + " " + stage + " " + wd
-           + "\n> " + cmd + "\n"
-
-  output.write(note, function (er) {
-    if (er) return cb(er)
-
-    exec( sh, [shFlag, cmd], env, true, wd
-        , user, group
-        , function (er, code, stdout, stderr) {
-      if (er && !npm.ROLLBACK) {
-        log("Failed to exec "+stage+" script", pkg._id)
-        er.message = pkg._id + " "
-                   + stage + ": `" + env.npm_lifecycle_script+"`\n"
-                   + er.message
-        if (er.errno !== constants.EPERM) {
-          er.errno = npm.ELIFECYCLE
-        }
-        er.pkgid = pkg._id
-        er.stage = stage
-        er.script = env.npm_lifecycle_script
-        er.pkgname = pkg.name
-        return cb(er)
-      } else if (er) {
-        log.error(er, pkg._id+"."+stage)
-        log.error("failed, but continuing anyway", pkg._id+"."+stage)
-        return cb()
+  var proc = spawn(sh, [shFlag, cmd], conf)
+  proc.on("close", function (code, signal) {
+    if (signal) {
+      process.kill(process.pid, signal);
+    } else if (code) {
+      var er = new Error("Exit status " + code)
+    }
+    if (er && !npm.ROLLBACK) {
+      log.info(pkg._id, "Failed to exec "+stage+" script")
+      er.message = pkg._id + " "
+                 + stage + ": `" + cmd +"`\n"
+                 + er.message
+      if (er.code !== "EPERM") {
+        er.code = "ELIFECYCLE"
       }
-      cb(er)
-    })
+      er.pkgid = pkg._id
+      er.stage = stage
+      er.script = cmd
+      er.pkgname = pkg.name
+      return cb(er)
+    } else if (er) {
+      log.error(pkg._id+"."+stage, er)
+      log.error(pkg._id+"."+stage, "continuing anyway")
+      return cb()
+    }
+    cb(er)
   })
 }
+
 
 function runHookLifecycle (pkg, env, wd, unsafe, cb) {
   // check for a hook script, run if present.
@@ -179,17 +249,9 @@ function runHookLifecycle (pkg, env, wd, unsafe, cb) {
 
   fs.stat(hook, function (er) {
     if (er) return cb()
-
-    exec( "sh", ["-c", cmd], env, true, wd
-        , user, group
-        , function (er) {
-      if (er) {
-        er.message += "\nFailed to exec "+stage+" hook script"
-        log(er, pkg._id)
-      }
-      if (npm.ROLLBACK) return cb()
-      cb(er)
-    })
+    var note = "\n> " + pkg._id + " " + stage + " " + wd
+             + "\n> " + cmd
+    runCmd(note, hook, pkg, env, stage, wd, unsafe, cb)
   })
 }
 
@@ -216,6 +278,9 @@ function makeEnv (data, prefix, env) {
 
   for (var i in data) if (i.charAt(0) !== "_") {
     var envKey = (prefix+i).replace(/[^a-zA-Z0-9_]/g, '_')
+    if (i === "readme") {
+      continue
+    }
     if (data[i] && typeof(data[i]) === "object") {
       try {
         // quick and dirty detection for cyclical structures
@@ -241,8 +306,7 @@ function makeEnv (data, prefix, env) {
 
   prefix = "npm_config_"
   var pkgConfig = {}
-    , ini = require("./ini.js")
-    , keys = ini.keys
+    , keys = npm.config.keys
     , pkgVerConfig = {}
     , namePref = data.name + ":"
     , verPref = data.name + "@" + data.version + ":"
@@ -251,12 +315,10 @@ function makeEnv (data, prefix, env) {
     if (i.charAt(0) === "_" && i.indexOf("_"+namePref) !== 0) {
       return
     }
-    var value = ini.get(i)
-    if (/^(log|out)fd$/.test(i) && typeof value === "object") {
-      // not an fd, a stream
-      return
-    }
+    var value = npm.config.get(i)
+    if (value instanceof Stream || Array.isArray(value)) return
     if (!value) value = ""
+    else if (typeof value === "number") value = "" + value
     else if (typeof value !== "string") value = JSON.stringify(value)
 
     value = -1 !== value.indexOf("\n")

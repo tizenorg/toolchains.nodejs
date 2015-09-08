@@ -1,4 +1,5 @@
 language: node_js
-before_install: "make &>out || cat out; rm out"
+script: "npm run-script tap"
 node_js:
-  - 0.6
+  - "0.11"
+  - "0.10"

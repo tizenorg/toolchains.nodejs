@@ -4,16 +4,32 @@ module.exports = prune
 
 prune.usage = "npm prune"
 
-var readInstalled = require("./utils/read-installed.js")
+var readInstalled = require("read-installed")
   , npm = require("./npm.js")
+  , path = require("path")
+  , readJson = require("read-package-json")
+  , log = require("npmlog")
 
 prune.completion = require("./utils/completion/installed-deep.js")
 
 function prune (args, cb) {
-  readInstalled(npm.prefix, function (er, data) {
+  //check if is a valid package.json file
+  var jsonFile = path.resolve(npm.dir, "..", "package.json" )
+  readJson(jsonFile, log.warn, function (er, data) {
     if (er) return cb(er)
-    prune_(args, data, cb)
+    next()
   })
+
+  function next() {
+    var opt = {
+      depth: npm.config.get("depth"),
+      dev: !npm.config.get("production") || npm.config.get("dev")
+    }
+    readInstalled(npm.prefix, opt, function (er, data) {
+      if (er) return cb(er)
+      prune_(args, data, cb)
+    })
+  }
 }
 
 function prune_ (args, data, cb) {

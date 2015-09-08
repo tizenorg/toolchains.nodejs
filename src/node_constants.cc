@@ -19,22 +19,27 @@
 // OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 // USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-#include <node_constants.h>
+// O_NONBLOCK is not exported unless _XOPEN_SOURCE >= 500.
+#if defined(_XOPEN_SOURCE) && _XOPEN_SOURCE < 500
+#undef _XOPEN_SOURCE
+#endif
 
-#include <uv.h>
+#if !defined(_XOPEN_SOURCE)
+#define _XOPEN_SOURCE 500
+#endif
+
+#include "node_constants.h"
+
+#include "uv.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #if !defined(_MSC_VER)
 #include <unistd.h>
 #endif
-#include <fcntl.h>
 #include <signal.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-
-#if defined(__MINGW32__) || defined(_MSC_VER)
-# include <platform_win32.h>
-#endif
 
 #if HAVE_OPENSSL
 # include <openssl/ssl.h>
@@ -110,6 +115,13 @@ void DefineConstants(Handle<Object> target) {
   NODE_DEFINE_CONSTANT(target, O_SYMLINK);
 #endif
 
+#ifdef O_DIRECT
+  NODE_DEFINE_CONSTANT(target, O_DIRECT);
+#endif
+
+#ifdef O_NONBLOCK
+  NODE_DEFINE_CONSTANT(target, O_NONBLOCK);
+#endif
 
 #ifdef S_IRWXU
   NODE_DEFINE_CONSTANT(target, S_IRWXU);
@@ -793,6 +805,10 @@ void DefineConstants(Handle<Object> target) {
 
 #ifdef SIGTSTP
   NODE_DEFINE_CONSTANT(target, SIGTSTP);
+#endif
+
+#ifdef SIGBREAK
+  NODE_DEFINE_CONSTANT(target, SIGBREAK);
 #endif
 
 #ifdef SIGTTIN

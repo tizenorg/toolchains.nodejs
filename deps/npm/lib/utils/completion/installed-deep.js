@@ -1,17 +1,21 @@
 module.exports = installedDeep
 
 var npm = require("../../npm.js")
-  , readInstalled = require("../read-installed.js")
+  , readInstalled = require("read-installed")
 
 function installedDeep (opts, cb) {
   var local
     , global
+    , depth = npm.config.get("depth")
+    , opt = { depth: depth, dev: true }
+
   if (npm.config.get("global")) local = [], next()
-  else readInstalled(npm.prefix, function (er, data) {
+  else readInstalled(npm.prefix, opt, function (er, data) {
     local = getNames(data || {})
     next()
   })
-  readInstalled(npm.config.get("prefix"), function (er, data) {
+
+  readInstalled(npm.config.get("prefix"), opt, function (er, data) {
     global = getNames(data || {})
     next()
   })

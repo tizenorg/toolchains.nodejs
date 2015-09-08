@@ -22,10 +22,10 @@
 #ifndef SRC_NODE_CRYPTO_H_
 #define SRC_NODE_CRYPTO_H_
 
-#include <node.h>
+#include "node.h"
 
-#include <node_object_wrap.h>
-#include <v8.h>
+#include "node_object_wrap.h"
+#include "v8.h"
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -35,18 +35,21 @@
 #include <openssl/x509v3.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
+#include <openssl/pkcs12.h>
 
 #ifdef OPENSSL_NPN_NEGOTIATED
-#include <node_buffer.h>
+#include "node_buffer.h"
 #endif
 
 #define EVP_F_EVP_DECRYPTFINAL 101
-
 
 namespace node {
 namespace crypto {
 
 static X509_STORE* root_cert_store;
+
+// Forward declaration
+class Connection;
 
 class SecureContext : ObjectWrap {
  public:
@@ -57,6 +60,8 @@ class SecureContext : ObjectWrap {
   X509_STORE *ca_store_;
 
  protected:
+  static const int kMaxSessionSize = 10 * 1024;
+
   static v8::Handle<v8::Value> New(const v8::Arguments& args);
   static v8::Handle<v8::Value> Init(const v8::Arguments& args);
   static v8::Handle<v8::Value> SetKey(const v8::Arguments& args);
@@ -68,6 +73,13 @@ class SecureContext : ObjectWrap {
   static v8::Handle<v8::Value> SetOptions(const v8::Arguments& args);
   static v8::Handle<v8::Value> SetSessionIdContext(const v8::Arguments& args);
   static v8::Handle<v8::Value> Close(const v8::Arguments& args);
+  static v8::Handle<v8::Value> LoadPKCS12(const v8::Arguments& args);
+
+  static SSL_SESSION* GetSessionCallback(SSL* s,
+                                         unsigned char* key,
+                                         int len,
+                                         int* copy);
+  static int NewSessionCallback(SSL* s, SSL_SESSION* sess);
 
   SecureContext() : ObjectWrap() {
     ctx_ = NULL;
@@ -98,6 +110,60 @@ class SecureContext : ObjectWrap {
  private:
 };
 
+class ClientHelloParser {
+ public:
+  enum FrameType {
+    kChangeCipherSpec = 20,
+    kAlert = 21,
+    kHandshake = 22,
+    kApplicationData = 23,
+    kOther = 255
+  };
+
+  enum HandshakeType {
+    kClientHello = 1
+  };
+
+  enum ParseState {
+    kWaiting,
+    kTLSHeader,
+    kSSLHeader,
+    kPaused,
+    kEnded
+  };
+
+  ClientHelloParser(Connection* c) : conn_(c),
+                                     state_(kWaiting),
+                                     offset_(0),
+                                     body_offset_(0) {
+    data_ = new uint8_t[kBufferSize];
+    if (!data_)
+      abort();
+  }
+
+  ~ClientHelloParser() {
+    if (data_) {
+      delete[] data_;
+      data_ = NULL;
+    }
+  }
+
+  size_t Write(const uint8_t* data, size_t len);
+  void Finish();
+
+  inline bool ended() { return state_ == kEnded; }
+
+ private:
+  static const int kBufferSize = 18432;
+  Connection* conn_;
+  ParseState state_;
+  size_t frame_len_;
+
+  uint8_t* data_;
+  size_t offset_;
+  size_t body_offset_;
+};
+
 class Connection : ObjectWrap {
  public:
   static void Initialize(v8::Handle<v8::Object> target);
@@ -108,7 +174,7 @@ class Connection : ObjectWrap {
 #endif
 
 #ifdef SSL_CTRL_SET_TLSEXT_SERVERNAME_CB
-  v8::Persistent<v8::Function> sniCallback_;
+  v8::Persistent<v8::Object> sniObject_;
   v8::Persistent<v8::Value> sniContext_;
   v8::Persistent<v8::String> servername_;
 #endif
@@ -124,14 +190,16 @@ class Connection : ObjectWrap {
   static v8::Handle<v8::Value> GetPeerCertificate(const v8::Arguments& args);
   static v8::Handle<v8::Value> GetSession(const v8::Arguments& args);
   static v8::Handle<v8::Value> SetSession(const v8::Arguments& args);
+  static v8::Handle<v8::Value> LoadSession(const v8::Arguments& args);
   static v8::Handle<v8::Value> IsSessionReused(const v8::Arguments& args);
   static v8::Handle<v8::Value> IsInitFinished(const v8::Arguments& args);
   static v8::Handle<v8::Value> VerifyError(const v8::Arguments& args);
   static v8::Handle<v8::Value> GetCurrentCipher(const v8::Arguments& args);
   static v8::Handle<v8::Value> Shutdown(const v8::Arguments& args);
-  static v8::Handle<v8::Value> ReceivedShutdown(const v8::Arguments& args);
   static v8::Handle<v8::Value> Start(const v8::Arguments& args);
   static v8::Handle<v8::Value> Close(const v8::Arguments& args);
+
+  static void InitNPN(SecureContext* sc, bool is_server);
 
 #ifdef OPENSSL_NPN_NEGOTIATED
   // NPN
@@ -155,7 +223,18 @@ class Connection : ObjectWrap {
 #endif
 
   int HandleBIOError(BIO *bio, const char* func, int rv);
-  int HandleSSLError(const char* func, int rv);
+
+  enum ZeroStatus {
+    kZeroIsNotAnError,
+    kZeroIsAnError
+  };
+
+  enum SyscallStatus {
+    kIgnoreSyscall,
+    kSyscallError
+  };
+
+  int HandleSSLError(const char* func, int rv, ZeroStatus zs, SyscallStatus ss);
 
   void ClearError();
   void SetShutdownFlags();
@@ -166,9 +245,10 @@ class Connection : ObjectWrap {
     return ss;
   }
 
-  Connection() : ObjectWrap() {
+  Connection() : ObjectWrap(), hello_parser_(this) {
     bio_read_ = bio_write_ = NULL;
     ssl_ = NULL;
+    next_sess_ = NULL;
   }
 
   ~Connection() {
@@ -177,13 +257,18 @@ class Connection : ObjectWrap {
       ssl_ = NULL;
     }
 
+    if (next_sess_ != NULL) {
+      SSL_SESSION_free(next_sess_);
+      next_sess_ = NULL;
+    }
+
 #ifdef OPENSSL_NPN_NEGOTIATED
     if (!npnProtos_.IsEmpty()) npnProtos_.Dispose();
     if (!selectedNPNProto_.IsEmpty()) selectedNPNProto_.Dispose();
 #endif
 
 #ifdef SSL_CTRL_SET_TLSEXT_SERVERNAME_CB
-   if (!sniCallback_.IsEmpty()) sniCallback_.Dispose();
+   if (!sniObject_.IsEmpty()) sniObject_.Dispose();
    if (!sniContext_.IsEmpty()) sniContext_.Dispose();
    if (!servername_.IsEmpty()) servername_.Dispose();
 #endif
@@ -196,9 +281,16 @@ class Connection : ObjectWrap {
   BIO *bio_write_;
   SSL *ssl_;
 
+  ClientHelloParser hello_parser_;
+
   bool is_server_; /* coverity[member_decl] */
+  SSL_SESSION* next_sess_;
+
+  friend class ClientHelloParser;
+  friend class SecureContext;
 };
 
+bool EntropySource(unsigned char* buffer, size_t length);
 void InitCrypto(v8::Handle<v8::Object> target);
 
 }  // namespace crypto

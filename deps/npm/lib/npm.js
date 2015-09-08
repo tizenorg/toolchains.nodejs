@@ -11,77 +11,53 @@ if (typeof WScript !== "undefined") {
 }
 
 
-// FIXME there really ought to be a path.split in node core
-require("path").SPLIT_CHAR = process.platform === "win32" ? "\\" : "/"
+// monkey-patch support for 0.6 child processes
+require('child-process-close')
 
 var EventEmitter = require("events").EventEmitter
   , npm = module.exports = new EventEmitter
   , config = require("./config.js")
-  , ini = require("./utils/ini.js")
-  , log = require("./utils/log.js")
+  , npmconf = require("npmconf")
+  , log = require("npmlog")
   , fs = require("graceful-fs")
   , path = require("path")
   , abbrev = require("abbrev")
   , which = require("which")
   , semver = require("semver")
-  , findPrefix = require("./utils/find-prefix.js")
-  , getUid = require("./utils/uid-number.js")
-  , mkdir = require("./utils/mkdir-p.js")
-  , slide = require("slide")
-  , chain = slide.chain
+  , RegClient = require("npm-registry-client")
+  , charSpin = require("char-spinner")
 
-npm.commands = {}
-npm.ELIFECYCLE = {}
-npm.E404 = {}
-npm.EPUBLISHCONFLICT = {}
-npm.EJSONPARSE = {}
-npm.EISGIT = {}
-npm.ECYCLE = {}
-npm.ENOTSUP = {}
-npm.EBADPLATFORM = {}
-
-// HACK for windows
-if (process.platform === "win32") {
-  // stub in unavailable methods from process and fs binding
-  if (!process.getuid) process.getuid = function() {}
-  if (!process.getgid) process.getgid = function() {}
-  var fsBinding = process.binding("fs")
-  if (!fsBinding.chown) fsBinding.chown = function() {
-    var cb = arguments[arguments.length - 1]
-    if (typeof cb == "function") cb()
-  }
-
-  // patch rename/renameSync, but this should really be fixed in node
-  var _fsRename = fs.rename
-    , _fsPathPatch
-  _fsPathPatch = function(p) {
-    return p && p.replace(/\\/g, "/") || p;
-  }
-  fs.rename = function(p1, p2) {
-    arguments[0] = _fsPathPatch(p1)
-    arguments[1] = _fsPathPatch(p2)
-    return _fsRename.apply(fs, arguments);
+npm.config = {
+  loaded: false,
+  get: function() {
+    throw new Error('npm.load() required')
+  },
+  set: function() {
+    throw new Error('npm.load() required')
   }
 }
 
+npm.commands = {}
+
 try {
+  var pv = process.version.replace(/^v/, '')
   // startup, ok to do this synchronously
   var j = JSON.parse(fs.readFileSync(
     path.join(__dirname, "../package.json"))+"")
   npm.version = j.version
   npm.nodeVersionRequired = j.engines.node
-  if (!semver.satisfies(process.version, j.engines.node)) {
-    log.error([""
-              ,"npm requires node version: "+j.engines.node
-              ,"And you have: "+process.version
-              ,"which is not satisfactory."
-              ,""
-              ,"Bad things will likely happen.  You have been warned."
-              ,""].join("\n"), "unsupported version")
+  if (!semver.satisfies(pv, j.engines.node)) {
+    log.warn("unsupported version", [""
+            ,"npm requires node version: "+j.engines.node
+            ,"And you have: "+pv
+            ,"which is not satisfactory."
+            ,""
+            ,"Bad things will likely happen.  You have been warned."
+            ,""].join("\n"))
   }
 } catch (ex) {
   try {
-    log(ex, "error reading version")
+    log.info("error reading version", ex)
   } catch (er) {}
   npm.version = ex
 }
@@ -99,6 +75,7 @@ var commandCache = {}
               , "ll" : "ls"
               , "ln" : "link"
               , "i" : "install"
+              , "isntall" : "install"
               , "up" : "update"
               , "c" : "config"
               , "info" : "view"
@@ -108,10 +85,16 @@ var commandCache = {}
               , "se" : "search"
               , "author" : "owner"
               , "home" : "docs"
+              , "issues": "bugs"
               , "unstar": "star" // same function
               , "apihelp" : "help"
               , "login": "adduser"
               , "add-user": "adduser"
+              , "tst": "test"
+              , "t": "test"
+              , "find-dupes": "dedupe"
+              , "ddp": "dedupe"
+              , "v": "view"
               }
 
   , aliasNames = Object.keys(aliases)
@@ -127,12 +110,14 @@ var commandCache = {}
               , "prune"
               , "submodule"
               , "pack"
+              , "dedupe"
 
               , "rebuild"
               , "link"
 
               , "publish"
               , "star"
+              , "stars"
               , "tag"
               , "adduser"
               , "unpublish"
@@ -150,6 +135,7 @@ var commandCache = {}
               , "edit"
               , "explore"
               , "docs"
+              , "repo"
               , "bugs"
               , "faq"
               , "root"
@@ -168,35 +154,75 @@ var commandCache = {}
                , "unbuild"
                , "xmas"
                , "substack"
+               , "visnup"
                ]
   , fullList = npm.fullList = cmdList.concat(aliasNames).filter(function (c) {
       return plumbing.indexOf(c) === -1
     })
   , abbrevs = abbrev(fullList)
 
+npm.spinner =
+  { int: null
+  , start: function () {
+      if (npm.spinner.int) return
+      var c = npm.config.get("spin")
+      if (!c) return
+      var stream = npm.config.get("logstream")
+      var opt = { tty: c !== "always", stream: stream }
+      npm.spinner.int = charSpin(opt)
+    }
+  , stop: function () {
+      clearInterval(npm.spinner.int)
+      npm.spinner.int = null
+    }
+  }
+
 Object.keys(abbrevs).concat(plumbing).forEach(function addCommand (c) {
   Object.defineProperty(npm.commands, c, { get : function () {
     if (!loaded) throw new Error(
-      "Call npm.load(conf, cb) before using this command.\n"+
+      "Call npm.load(config, cb) before using this command.\n"+
       "See the README.md or cli.js for example usage.")
     var a = npm.deref(c)
     if (c === "la" || c === "ll") {
       npm.config.set("long", true)
     }
+
     npm.command = c
     if (commandCache[a]) return commandCache[a]
+
     var cmd = require(__dirname+"/"+a+".js")
+
     commandCache[a] = function () {
       var args = Array.prototype.slice.call(arguments, 0)
       if (typeof args[args.length - 1] !== "function") {
         args.push(defaultCb)
       }
       if (args.length === 1) args.unshift([])
+
+      npm.spinner.start()
+
+      npm.registry.version = npm.version
+      if (!npm.registry.refer) {
+        npm.registry.refer = [a].concat(args[0]).map(function (arg) {
+          // exclude anything that might be a URL, path, or private module
+          // Those things will always have a slash in them somewhere
+          if (arg && arg.match && arg.match(/\/|\\/)) {
+            return "[REDACTED]"
+          } else {
+            return arg
+          }
+        }).filter(function (arg) {
+          return arg && arg.match
+        }).join(" ")
+      }
+
       cmd.apply(npm, args)
     }
+
     Object.keys(cmd).forEach(function (k) {
       commandCache[a][k] = cmd[k]
     })
+
     return commandCache[a]
   }, enumerable: fullList.indexOf(c) !== -1 })
 
@@ -236,11 +262,10 @@ function loadCb (er) {
   loadListeners.length = 0
 }
 
-
-npm.load = function (conf, cb_) {
-  if (!cb_ && typeof conf === "function") cb_ = conf , conf = {}
+npm.load = function (cli, cb_) {
+  if (!cb_ && typeof cli === "function") cb_ = cli , cli = {}
   if (!cb_) cb_ = function () {}
-  if (!conf) conf = {}
+  if (!cli) cli = {}
   loadListeners.push(cb_)
   if (loaded || loadErr) return cb(loadErr)
   if (loading) return
@@ -249,6 +274,10 @@ npm.load = function (conf, cb_) {
 
   function cb (er) {
     if (loadErr) return
+    if (npm.config.get("force")) {
+      log.warn("using --force", "I sure hope you know what you are doing.")
+    }
+    npm.config.loaded = true
     loaded = true
     loadCb(loadErr = er)
     if (onload = onload && npm.config.get("onload-script")) {
@@ -257,13 +286,12 @@ npm.load = function (conf, cb_) {
     }
   }
 
-  log.waitForConfig()
+  log.pause()
 
-  load(npm, conf, cb)
+  load(npm, cli, cb)
 }
 
-
-function load (npm, conf, cb) {
+function load (npm, cli, cb) {
   which(process.argv[0], function (er, node) {
     if (!er && node.toUpperCase() !== process.execPath.toUpperCase()) {
       log.verbose("node symlink", node)
@@ -274,107 +302,69 @@ function load (npm, conf, cb) {
     // look up configs
     //console.error("about to look up configs")
 
-    ini.resolveConfigs(conf, function (er) {
-      //console.error("back from config lookup", er && er.stack)
+    var builtin = path.resolve(__dirname, "..", "npmrc")
+    npmconf.load(cli, builtin, function (er, config) {
+      if (er === config) er = null
+
+      // Include npm-version and node-version in user-agent
+      var ua = config.get("user-agent") || ""
+      ua = ua.replace(/\{node-version\}/gi, process.version)
+      ua = ua.replace(/\{npm-version\}/gi, npm.version)
+      ua = ua.replace(/\{platform\}/gi, process.platform)
+      ua = ua.replace(/\{arch\}/gi, process.arch)
+      config.set("user-agent", ua)
+
+      npm.config = config
+
+      var color = config.get("color")
+
+      log.level = config.get("loglevel")
+      log.heading = config.get("heading") || "npm"
+      log.stream = config.get("logstream")
+      switch (color) {
+        case "always": log.enableColor(); break
+        case false: log.disableColor(); break
+      }
+      log.resume()
+
       if (er) return cb(er)
 
-      var umask = parseInt(conf.umask, 8)
+      // see if we need to color normal output
+      switch (color) {
+        case "always":
+          npm.color = true
+          break
+        case false:
+          npm.color = false
+          break
+        default:
+          var tty = require("tty")
+          if (process.stdout.isTTY) npm.color = true
+          else if (!tty.isatty) npm.color = true
+          else if (tty.isatty(1)) npm.color = true
+          else npm.color = false
+          break
+      }
+
+      // at this point the configs are all set.
+      // go ahead and spin up the registry client.
+      npm.registry = new RegClient(npm.config)
+
+      var umask = npm.config.get("umask")
       npm.modes = { exec: 0777 & (~umask)
                   , file: 0666 & (~umask)
                   , umask: umask }
 
-      chain([ [ loadPrefix, npm, conf ]
-            , [ setUser, ini.configList, ini.defaultConfig ]
-            , [ loadUid, npm, conf ]
-            ], cb)
+      var gp = Object.getOwnPropertyDescriptor(config, "globalPrefix")
+      Object.defineProperty(npm, "globalPrefix", gp)
+
+      var lp = Object.getOwnPropertyDescriptor(config, "localPrefix")
+      Object.defineProperty(npm, "localPrefix", lp)
+
+      return cb()
     })
   })
 }
-
-function loadPrefix (npm, conf, cb) {
-  // try to guess at a good node_modules location.
-  var p
-    , gp
-  if (!conf.hasOwnProperty("prefix")) {
-    p = process.cwd()
-  } else {
-    p = npm.config.get("prefix")
-  }
-  gp = npm.config.get("prefix")
-
-  findPrefix(p, function (er, p) {
-    Object.defineProperty(npm, "localPrefix",
-      { get : function () { return p }
-      , set : function (r) { return p = r }
-      , enumerable : true
-      })
-    // the prefix MUST exist, or else nothing works.
-    if (!npm.config.get("global")) {
-      mkdir(p, npm.modes.exec, null, null, true, next)
-    } else {
-      next(er)
-    }
-  })
-
-  findPrefix(gp, function (er, gp) {
-    Object.defineProperty(npm, "globalPrefix",
-      { get : function () { return gp }
-      , set : function (r) { return gp = r }
-      , enumerable : true
-      })
-    // the prefix MUST exist, or else nothing works.
-    mkdir(gp, npm.modes.exec, null, null, true, next)
-  })
-
-  var i = 2
-    , errState = null
-  function next (er) {
-    if (errState) return
-    if (er) return cb(errState = er)
-    if (--i === 0) return cb()
-  }
-}
-
-
-function loadUid (npm, conf, cb) {
-  // if we're not in unsafe-perm mode, then figure out who
-  // to run stuff as.  Do this first, to support `npm update npm -g`
-  if (!npm.config.get("unsafe-perm")) {
-    getUid(npm.config.get("user"), npm.config.get("group"), cb)
-  } else {
-    process.nextTick(cb)
-  }
-}
-
-function setUser (cl, dc, cb) {
-  // If global, leave it as-is.
-  // If not global, then set the user to the owner of the prefix folder.
-  // Just set the default, so it can be overridden.
-  if (cl.get("global")) return cb()
-  if (process.env.SUDO_UID) {
-    dc.user = +(process.env.SUDO_UID)
-    return cb()
-  }
-
-  var prefix = path.resolve(cl.get("prefix"))
-  mkdir(prefix, function (er) {
-    if (er) {
-      log.error(prefix, "could not create prefix directory")
-      return cb(er)
-    }
-    fs.stat(prefix, function (er, st) {
-      dc.user = st && st.uid
-      return cb(er)
-    })
-  })
-}
-
-
-npm.config =
-  { get : function (key) { return ini.get(key) }
-  , set : function (key, val) { return ini.set(key, val, "cli") }
-  , del : function (key, val) { return ini.del(key, val, "cli") }
-  }
 
 Object.defineProperty(npm, "prefix",
   { get : function () {
@@ -430,9 +420,14 @@ Object.defineProperty(npm, "cache",
   })
 
 var tmpFolder
+var crypto = require("crypto")
+var rand = crypto.randomBytes(6)
+                 .toString("base64")
+                 .replace(/\//g, '_')
+                 .replace(/\+/, '-')
 Object.defineProperty(npm, "tmp",
   { get : function () {
-      if (!tmpFolder) tmpFolder = "npm-"+Date.now()
+      if (!tmpFolder) tmpFolder = "npm-" + process.pid + "-" + rand
       return path.resolve(npm.config.get("tmp"), tmpFolder)
     }
   , enumerable : true
@@ -440,7 +435,7 @@ Object.defineProperty(npm, "tmp",
 
 // the better to repl you with
 Object.getOwnPropertyNames(npm.commands).forEach(function (n) {
-  if (npm.hasOwnProperty(n)) return
+  if (npm.hasOwnProperty(n) || n === "config") return
 
   Object.defineProperty(npm, n, { get: function () {
     return function () {

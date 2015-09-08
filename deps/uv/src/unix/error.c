@@ -59,6 +59,7 @@ void uv_fatal_error(const int errorno, const char* syscall) {
 uv_err_code uv_translate_sys_error(int sys_errno) {
   switch (sys_errno) {
     case 0: return UV_OK;
+    case EIO: return UV_EIO;
     case EPERM: return UV_EPERM;
     case ENOSYS: return UV_ENOSYS;
     case ENOTSOCK: return UV_ENOTSOCK;
@@ -67,13 +68,19 @@ uv_err_code uv_translate_sys_error(int sys_errno) {
     case EAFNOSUPPORT: return UV_EAFNOSUPPORT;
     case EBADF: return UV_EBADF;
     case EPIPE: return UV_EPIPE;
+    case ESPIPE: return UV_ESPIPE;
     case EAGAIN: return UV_EAGAIN;
+#if EWOULDBLOCK != EAGAIN
+    case EWOULDBLOCK: return UV_EAGAIN;
+#endif
     case ECONNRESET: return UV_ECONNRESET;
     case EFAULT: return UV_EFAULT;
     case EMFILE: return UV_EMFILE;
     case EMSGSIZE: return UV_EMSGSIZE;
     case ENAMETOOLONG: return UV_ENAMETOOLONG;
     case EINVAL: return UV_EINVAL;
+    case ENETDOWN: return UV_ENETDOWN;
+    case ENETUNREACH: return UV_ENETUNREACH;
     case ECONNABORTED: return UV_ECONNABORTED;
     case ELOOP: return UV_ELOOP;
     case ECONNREFUSED: return UV_ECONNREFUSED;
@@ -81,6 +88,7 @@ uv_err_code uv_translate_sys_error(int sys_errno) {
     case EADDRNOTAVAIL: return UV_EADDRNOTAVAIL;
     case ENOTDIR: return UV_ENOTDIR;
     case EISDIR: return UV_EISDIR;
+    case ENODEV: return UV_ENODEV;
     case ENOTCONN: return UV_ENOTCONN;
     case EEXIST: return UV_EEXIST;
     case EHOSTUNREACH: return UV_EHOSTUNREACH;
@@ -89,11 +97,20 @@ uv_err_code uv_translate_sys_error(int sys_errno) {
     case ETIMEDOUT: return UV_ETIMEDOUT;
     case EXDEV: return UV_EXDEV;
     case EBUSY: return UV_EBUSY;
+#if ENOTEMPTY != EEXIST
     case ENOTEMPTY: return UV_ENOTEMPTY;
+#endif
     case ENOSPC: return UV_ENOSPC;
+    case EROFS: return UV_EROFS;
+    case ENOMEM: return UV_ENOMEM;
+    case EDQUOT: return UV_ENOSPC;
+    case EFBIG: return UV_EFBIG;
+    case ENOPROTOOPT: return UV_ENOPROTOOPT;
+    case ETXTBSY: return UV_ETXTBSY;
+    case ERANGE: return UV_ERANGE;
+    case ENXIO: return UV_ENXIO;
+    case EMLINK: return UV_EMLINK;
     default: return UV_UNKNOWN;
   }
-
-  assert(0 && "unreachable");
-  return -1;
+  UNREACHABLE();
 }

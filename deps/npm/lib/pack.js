@@ -7,11 +7,9 @@ module.exports = pack
 var npm = require("./npm.js")
   , install = require("./install.js")
   , cache = require("./cache.js")
-  , output = require("./utils/output.js")
   , fs = require("graceful-fs")
   , chain = require("slide").chain
   , path = require("path")
-  , relativize = require("./utils/relativize.js")
   , cwd = process.cwd()
 
 pack.usage = "npm pack <pkg>"
@@ -34,14 +32,15 @@ function pack (args, silent, cb) {
 
 function printFiles (files, cb) {
   files = files.map(function (file) {
-    return relativize(file, cwd)
+    return path.relative(cwd, file)
   })
-  output.write(files.join("\n"), cb)
+  console.log(files.join("\n"))
+  cb()
 }
 
 // add to cache, then cp to the cwd
 function pack_ (pkg, cb) {
-  cache.add(pkg, function (er, data) {
+  cache.add(pkg, null, false, function (er, data) {
     if (er) return cb(er)
     var fname = path.resolve(data._id.replace(/@/g, "-") + ".tgz")
       , cached = path.resolve( npm.cache

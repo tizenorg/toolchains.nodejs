@@ -50,6 +50,15 @@ static void connect_cb(uv_connect_t* connect_req, int status) {
 }
 
 
+static void connect_cb_file(uv_connect_t* connect_req, int status) {
+  ASSERT(status == -1);
+  ASSERT(uv_last_error(uv_default_loop()).code == UV_ENOTSOCK ||
+         uv_last_error(uv_default_loop()).code == UV_ECONNREFUSED);
+  uv_close((uv_handle_t*)connect_req->handle, close_cb);
+  connect_cb_called++;
+}
+
+
 TEST_IMPL(pipe_connect_bad_name) {
   uv_pipe_t client;
   uv_connect_t req;
@@ -59,10 +68,31 @@ TEST_IMPL(pipe_connect_bad_name) {
   ASSERT(r == 0);
   uv_pipe_connect(&req, &client, BAD_PIPENAME, connect_cb);
 
-  uv_run(uv_default_loop());
+  uv_run(uv_default_loop(), UV_RUN_DEFAULT);
 
   ASSERT(close_cb_called == 1);
   ASSERT(connect_cb_called == 1);
 
+  MAKE_VALGRIND_HAPPY();
+  return 0;
+}
+
+
+TEST_IMPL(pipe_connect_to_file) {
+  const char* path = "test/fixtures/empty_file";
+  uv_pipe_t client;
+  uv_connect_t req;
+  int r;
+
+  r = uv_pipe_init(uv_default_loop(), &client, 0);
+  ASSERT(r == 0);
+  uv_pipe_connect(&req, &client, path, connect_cb_file);
+
+  uv_run(uv_default_loop(), UV_RUN_DEFAULT);
+
+  ASSERT(close_cb_called == 1);
+  ASSERT(connect_cb_called == 1);
+
+  MAKE_VALGRIND_HAPPY();
   return 0;
 }

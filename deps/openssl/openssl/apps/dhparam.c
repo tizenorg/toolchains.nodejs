@@ -332,7 +332,6 @@ bad:
 			BIO_printf(bio_err,"This is going to take a long time\n");
 			if(!dh || !DH_generate_parameters_ex(dh, num, g, &cb))
 				{
-				if(dh) DH_free(dh);
 				ERR_print_errors(bio_err);
 				goto end;
 				}
@@ -550,5 +549,11 @@ static int MS_CALLBACK dh_cb(int p, int n, BN_GENCB *cb)
 #endif
 	return 1;
 	}
+
+#else /* !OPENSSL_NO_DH */
+
+# if PEDANTIC
+static void *dummy=&dummy;
+# endif
 
 #endif
