@@ -1,5 +1,5 @@
 Name: nodejs
 Description: Evented I/O for V8 JavaScript
-Version: 0.10.26
+Version: 0.12.0
 Libs:
 Cflags: -I/usr/include/node

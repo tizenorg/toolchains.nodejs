@@ -41,8 +41,8 @@ var parseTests = {
     hostname: 'evil-phisher',
     pathname: '/foo.html',
     path: '/foo.html',
-    hash: '#h\\a\\s\\h',
-    href: 'http://evil-phisher/foo.html#h\\a\\s\\h'
+    hash: '#h%5Ca%5Cs%5Ch',
+    href: 'http://evil-phisher/foo.html#h%5Ca%5Cs%5Ch'
   },
 
 
@@ -773,6 +773,17 @@ var parseTests = {
     'path': '/test',
   },
 
+  'http://x:1/\' <>"`/{}|\\^~`/': {
+    protocol: 'http:',
+    slashes: true,
+    host: 'x:1',
+    port: '1',
+    hostname: 'x',
+    pathname: '/%27%20%3C%3E%22%60/%7B%7D%7C/%5E~%60/',
+    path: '/%27%20%3C%3E%22%60/%7B%7D%7C/%5E~%60/',
+    href: 'http://x:1/%27%20%3C%3E%22%60/%7B%7D%7C/%5E~%60/'
+  },
+
   'http://a@b@c/': {
     protocol: 'http:',
     slashes: true,
@@ -856,6 +867,20 @@ var parseTestsWithQueryString = {
     'search': '',
     'pathname': '/',
     'path': '/'
+  },
+  '/example?query=value':{
+    protocol: null,
+    slashes: null,
+    auth: null,
+    host: null,
+    port: null,
+    hostname: null,
+    hash: null,
+    search: '?query=value',
+    query: { query: 'value' },
+    pathname: '/example',
+    path: '/example?query=value',
+    href: '/example?query=value'
   }
 };
 for (var u in parseTestsWithQueryString) {
@@ -1453,13 +1478,13 @@ relativeTests.forEach(function(relativeTest) {
 });
 
 //format: [to, from, result]
-// the test: ['.//g', 'f:/a', 'f://g'] is a fundimental problem
+// the test: ['.//g', 'f:/a', 'f://g'] is a fundamental problem
 // url.parse('f:/a') does not have a host
-// url.resolve('f:/a', './/g') does not have a host becuase you have moved
+// url.resolve('f:/a', './/g') does not have a host because you have moved
 // down to the g directory.  i.e. f:     //g, however when this url is parsed
 // f:// will indicate that the host is g which is not the case.
 // it is unclear to me how to keep this information from being lost
-// it may be that a pathname of ////g should colapse to /g but this seems
+// it may be that a pathname of ////g should collapse to /g but this seems
 // to be a lot of work for an edge case.  Right now I remove the test
 if (relativeTests2[181][0] === './/g' &&
     relativeTests2[181][1] === 'f:/a' &&
@@ -1479,7 +1504,3 @@ relativeTests2.forEach(function(relativeTest) {
                'format(' + relativeTest[1] + ') == ' + expected +
                '\nactual:' + actual);
 });
-
-// backslashes should be like forward slashes
-var res = url.resolve('http://example.com/x', '\\\\foo.com\\bar');
-assert.equal(res, 'http://foo.com/bar');
